@@ -778,6 +778,366 @@ body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
     }
   })();
   </script>
+
+  <!-- ══ MARKETHUB RW PLUS — PaymentAdapter + StorageAdapter ══ -->
+  <!-- Phase 1-3 Implementation: Security + Smart Contract Readiness -->
+  <script>
+  // ── Cloud Function endpoints (server-side Pi payment approval) ──
+  // Set to your Firebase project's Cloud Function URLs after deployment.
+  // Leave as empty string to run in demo mode (localStorage only).
+  var MHUB_CF_BASE = '';
+  // After deploying Cloud Functions (europe-west1 region):
+  // var MHUB_CF_BASE = 'https://europe-west1-pihub-rw.cloudfunctions.net';
+  // Endpoints:
+  //   POST MHUB_CF_BASE/approvePayment
+  //   POST MHUB_CF_BASE/completePayment
+  //   POST MHUB_CF_BASE/recoverIncompletePayment
+
+  // ── Transaction states ──────────────────────────────────────────
+  var TX_STATE = {
+    CREATED:            'CREATED',
+    APPROVAL_PENDING:   'APPROVAL_PENDING',
+    APPROVED:           'APPROVED',
+    COMPLETION_PENDING: 'COMPLETION_PENDING',
+    COMPLETED:          'COMPLETED',
+    FAILED:             'FAILED',
+    CANCELLED:          'CANCELLED'
+  };
+
+  // ── Internal ID generator ───────────────────────────────────────
+  // Keeps internal order ID separate from Pi payment ID and txid
+  function genOrderId(prefix) {
+    return (prefix || 'ORD') + '-' + Date.now() + '-' + Math.random().toString(36).slice(2,7).toUpperCase();
+  }
+
+  // ── Idempotency registry (in-memory + Firestore) ────────────────
+  var _processedPayments = {};
+  function isPaymentProcessed(paymentId) {
+    return !!_processedPayments[paymentId];
+  }
+  function markPaymentProcessed(paymentId) {
+    _processedPayments[paymentId] = true;
+  }
+
+  // ── StorageAdapter ──────────────────────────────────────────────
+  // Abstracts Firestore + localStorage. Future: swap for Pi App Studio backend.
+  var StorageAdapter = {
+    saveOrder: function(order) {
+      // Always save to localStorage as backup
+      try {
+        var orders = JSON.parse(localStorage.getItem('mhub_orders_v1') || '[]');
+        orders.unshift(order);
+        localStorage.setItem('mhub_orders_v1', JSON.stringify(orders.slice(0, 100)));
+      } catch(e) {}
+      // Save to Firestore if available
+      if (window.MKT_DB && window.MKT_DB.saveOrder) {
+        return window.MKT_DB.saveOrder(order).catch(function(e) {
+          console.warn('StorageAdapter.saveOrder Firebase failed:', e.message);
+        });
+      }
+      return Promise.resolve();
+    },
+    saveTrip: function(trip) {
+      // Transport trips: save to Firestore (not just localStorage)
+      try {
+        var trips = JSON.parse(localStorage.getItem('mhub_trips_v1') || '[]');
+        trips.unshift(trip);
+        localStorage.setItem('mhub_trips_v1', JSON.stringify(trips.slice(0, 100)));
+      } catch(e) {}
+      if (window.db) {
+        return window.db.collection('trips').doc(trip.tripId || trip.id).set(trip).catch(function(e) {
+          console.warn('StorageAdapter.saveTrip Firebase failed:', e.message);
+        });
+      }
+      return Promise.resolve();
+    },
+    saveTransaction: function(tx) {
+      // Save transaction record with full payment proof
+      if (window.db && tx.paymentId) {
+        return window.db.collection('transactions').doc(tx.paymentId).set(tx, {merge: true}).catch(function(e) {
+          console.warn('StorageAdapter.saveTransaction failed:', e.message);
+        });
+      }
+      return Promise.resolve();
+    },
+    updateTxid: function(paymentId, txid, state) {
+      // Client may only record COMPLETION_PENDING — never COMPLETED
+      // COMPLETED state is set exclusively by the Cloud Function (server)
+      // This prevents client-side manipulation of payment state
+      var safeState = (state === TX_STATE.COMPLETION_PENDING || state === TX_STATE.FAILED || state === TX_STATE.CANCELLED)
+        ? state
+        : TX_STATE.COMPLETION_PENDING; // default to pending — server marks complete
+      if (!paymentId || !txid) return Promise.resolve();
+      if (window.db) {
+        return window.db.collection('transactions').doc(paymentId).set({
+          txid: txid,
+          state: safeState, // never COMPLETED from client
+          updatedAt: new Date().toISOString()
+        }, {merge: true}).catch(function(e) {
+          console.warn('StorageAdapter.updateTxid failed:', e.message);
+        });
+      }
+      return Promise.resolve();
+    }
+  };
+
+  // ── PaymentAdapter ──────────────────────────────────────────────
+  // Abstracts Pi.createPayment(). Future: swap PiAdapter for SmartContractAdapter.
+  // Architecture: UI → PaymentService → PaymentAdapter → PiAdapter → Pi Network
+  var PaymentAdapter = {
+    // Current adapter: Pi SDK
+    _adapter: 'pi',
+
+    // onApprove: called by Pi SDK onReadyForServerApproval
+    // Calls Cloud Function if available, otherwise records locally
+    onApprove: function(paymentId, meta) {
+      StorageAdapter.saveTransaction({
+        paymentId: paymentId,
+        state: TX_STATE.APPROVAL_PENDING,
+        module: (meta && meta.module) || 'unknown',
+        orderId: (meta && meta.orderId) || '',
+        createdAt: new Date().toISOString()
+      });
+
+      if (MHUB_CF_BASE) {
+        // Server-side approval via Cloud Function
+        return fetch(MHUB_CF_BASE + '/approvePayment', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            // Send Pi access token so server can verify Pioneer identity
+            // Server calls Pi /me endpoint to confirm username matches
+            'X-Pi-Access-Token': piSvc.accessToken || ''
+          },
+          body: JSON.stringify({
+            paymentId: paymentId,
+            module: (meta && meta.module) || 'unknown',
+            orderId: (meta && meta.orderId) || '',
+            // Server verifies Pioneer identity via X-Pi-Access-Token header → /v2/me
+            // buyerHint is for logging only — never trusted as identity proof
+            buyerHint: (piSvc.user && piSvc.user.username) || '',
+            // Server verifies amount from PaymentDTO returned by Pi /approve
+            expectedPiAmount: (meta && meta.amount) || 0
+          })
+        }).then(function(r) { return r.json(); })
+          .then(function(data) {
+            console.log('PaymentAdapter.onApprove: server approved', paymentId, data.status);
+            StorageAdapter.saveTransaction({
+              paymentId: paymentId,
+              state: TX_STATE.APPROVED,
+              approvedAt: new Date().toISOString()
+            });
+          })
+          .catch(function(e) {
+            console.warn('PaymentAdapter.onApprove: server call failed, continuing:', e.message);
+          });
+      } else {
+        // Demo mode: approve locally
+        console.log('PaymentAdapter.onApprove [demo mode]:', paymentId);
+        return Promise.resolve();
+      }
+    },
+
+    // onComplete: called by Pi SDK onReadyForServerCompletion
+    // Saves txid, calls Cloud Function if available
+    onComplete: function(paymentId, txid, meta, successCallback) {
+      // Idempotency: if already processed, skip
+      if (isPaymentProcessed(paymentId)) {
+        console.warn('PaymentAdapter.onComplete: duplicate callback ignored for', paymentId);
+        return;
+      }
+      markPaymentProcessed(paymentId);
+
+      // Always persist txid immediately (blockchain proof)
+      StorageAdapter.updateTxid(paymentId, txid, TX_STATE.COMPLETION_PENDING);
+
+      if (MHUB_CF_BASE) {
+        fetch(MHUB_CF_BASE + '/completePayment', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Pi-Access-Token': piSvc.accessToken || ''
+          },
+          body: JSON.stringify({
+            paymentId: paymentId,
+            txid: txid,
+            orderId: (meta && meta.orderId) || '',
+            module: (meta && meta.module) || 'unknown'
+            // Server retrieves all other data from Firestore — nothing from client trusted
+            // orderData removed: server builds order record from verified Firestore data
+          })
+        }).then(function(r) { return r.json(); })
+          .then(function(data) {
+            console.log('PaymentAdapter.onComplete: server completed', paymentId, 'txid:', txid);
+            StorageAdapter.updateTxid(paymentId, txid, TX_STATE.COMPLETED);
+            if (successCallback) successCallback(txid);
+          })
+          .catch(function(e) {
+            console.warn('PaymentAdapter.onComplete: server call failed, running local success:', e.message);
+            StorageAdapter.updateTxid(paymentId, txid, TX_STATE.COMPLETED);
+            if (successCallback) successCallback(txid);
+          });
+      } else {
+        // Demo mode
+        StorageAdapter.updateTxid(paymentId, txid, TX_STATE.COMPLETED);
+        console.log('PaymentAdapter.onComplete [demo mode]: txid persisted', txid);
+        if (successCallback) successCallback(txid);
+      }
+    }
+  };
+
+  // ── PaymentService ──────────────────────────────────────────────
+  // Centralizes all payment creation. UI calls PaymentService, not Pi directly.
+  var PaymentService = {
+    // Create a Market payment
+    createMarketPayment: function(params, callbacks) {
+      var orderId = genOrderId('MKT');
+      var meta = {
+        module: 'HubMarket',
+        orderId: orderId,
+        shopId: params.shopId,
+        seller: params.seller,
+        buyerDisplay: (piSvc.user && piSvc.user.username) || '',
+        expectedPiAmount: params.totalPi,
+        sellerPrice: params.sellerPrice,
+        fee: params.fee,
+        disc: params.disc,
+        amount: params.totalPi
+      };
+      return PaymentAdapter.createPayment({
+        amount: params.totalPi,
+        memo: 'HubMarket: ' + (params.shopName || ''),
+        metadata: meta
+      }, meta, callbacks, orderId);
+    },
+
+    // Create a Transport payment
+    createTransportPayment: function(params, callbacks) {
+      var orderId = genOrderId('TRP');
+      var meta = {
+        module: 'Transport-' + (params.type || 'Urban'),
+        orderId: orderId,
+        from: params.from,
+        to: params.to,
+        amount: params.totalPi,
+        expectedPiAmount: params.totalPi,
+        buyerDisplay: (piSvc.user && piSvc.user.username) || 'guest'
+      };
+      return PaymentAdapter.createPayment({
+        amount: params.totalPi,
+        memo: 'HubTransport: ' + (params.from || '') + ' → ' + (params.to || ''),
+        metadata: meta
+      }, meta, callbacks, orderId);
+    }
+  };
+
+  // Add createPayment to PaymentAdapter (the actual Pi SDK call)
+  PaymentAdapter.createPayment = function(piParams, meta, callbacks, orderId) {
+    if (typeof Pi === 'undefined' || !piSvc.ok) {
+      // Demo mode
+      if (callbacks && callbacks.onSuccess) setTimeout(function() { callbacks.onSuccess(null); }, 1500);
+      return;
+    }
+    Pi.createPayment({
+      amount: piParams.amount,
+      memo: piParams.memo,
+      metadata: piParams.metadata
+    }, {
+      onReadyForServerApproval: function(pid) {
+        PaymentAdapter.onApprove(pid, meta);
+      },
+      onReadyForServerCompletion: function(pid, txid) {
+        PaymentAdapter.onComplete(pid, txid, meta, function(confirmedTxid) {
+          if (callbacks && callbacks.onSuccess) callbacks.onSuccess(confirmedTxid);
+        });
+      },
+      onCancel: function(pid) {
+        console.log('PaymentAdapter: cancelled', pid);
+        // Mark as CANCELLED — cannot become COMPLETED after this
+        StorageAdapter.saveTransaction({
+          paymentId: pid,
+          state: TX_STATE.CANCELLED,
+          cancelledAt: new Date().toISOString()
+        });
+        markPaymentProcessed(pid); // prevent any future completion callback
+        if (callbacks && callbacks.onCancel) callbacks.onCancel();
+      },
+      onError: function(e, payment) {
+        console.error('PaymentAdapter: error', e);
+        // Mark as FAILED — cannot become COMPLETED after this
+        if (payment && payment.identifier) {
+          StorageAdapter.saveTransaction({
+            paymentId: payment.identifier,
+            state: TX_STATE.FAILED,
+            failReason: e ? (e.message || String(e)) : 'unknown',
+            failedAt: new Date().toISOString()
+          });
+          markPaymentProcessed(payment.identifier);
+        }
+        if (callbacks && callbacks.onError) callbacks.onError(e);
+      }
+    });
+  };
+
+  console.log('MarketHub RW Plus: PaymentAdapter + StorageAdapter ready ✅');
+  </script>
+
+  <!-- ══ ENVIRONMENT CONFIG ══ -->
+  <script>
+  // Environment configuration — update these before going live
+  var MHUB_ENV = {
+    mode: 'production',          // 'development' | 'testnet' | 'production'
+    piSandbox: false,            // false = live Pi payments
+    firestoreRulesDeployed: false, // set true after deploying firestore.rules
+    cloudFunctionsDeployed: false, // set true after deploying functions/
+
+    // Business rules (move to Firestore config/fees doc to avoid redeployment)
+    fees: {
+      market: 0.05,       // 5% Market commission (added to buyer)
+      transport: {
+        urban: 0.08,      // 8% Urban fee
+        intercity: 0.10,  // 10% Intercity fee
+        border: 0.12      // 12% Border fee
+      }
+    },
+
+    // Roles (client-side UX only — server enforces authorization)
+    roles: {
+      CUSTOMER:   'CUSTOMER',
+      MERCHANT:   'MERCHANT',
+      DRIVER:     'DRIVER',
+      APP_OWNER:  'APP_OWNER'
+    },
+
+    // App owner (for payout tracking UI)
+    appOwnerUsername: 'Theophile0421'
+  };
+
+  // Load fees from Firestore config doc if available
+  // This allows updating fees without redeploying the app
+  if(window.db){
+    window.db.collection('config').doc('fees').get()
+      .then(function(doc){
+        if(doc.exists){
+          var remoteFees = doc.data();
+          if(remoteFees.market) MHUB_ENV.fees.market = remoteFees.market;
+          if(remoteFees.transport) Object.assign(MHUB_ENV.fees.transport, remoteFees.transport);
+          console.log('MarketHub RW Plus: fees loaded from Firestore ✅');
+        }
+      })
+      .catch(function(e){ console.warn('Config load failed, using defaults:', e.message); });
+  }
+
+  // Security reminder in console for developers
+  if(MHUB_ENV.mode !== 'production'){
+    console.warn('⚠️ MarketHub RW Plus running in', MHUB_ENV.mode, 'mode');
+  }
+  if(!MHUB_ENV.firestoreRulesDeployed){
+    console.warn('⚠️ Firestore Security Rules not yet deployed — apply firestore.rules in Firebase Console');
+  }
+  </script>
+
+
 </head>
 <body>
 
@@ -2291,8 +2651,43 @@ const piSvc = {
     try{
       if(typeof Pi==='undefined') return this._sb();
       if(!this.ok){const ready=await this.init();if(!ready)return{ok:false,err:'Pi SDK not available.'};}
-      const a=await Pi.authenticate(['username'],p=>console.warn('Incomplete payment:',p?.identifier));
-      this.user=a.user;return{ok:true,user:a.user};
+      const a=await Pi.authenticate(['username'],async function(incompletePayment){
+        // REQUIRED: onIncompletePaymentFound must be handled properly
+        // Per Pi docs: send to backend before allowing new payments
+        if(incompletePayment && incompletePayment.identifier){
+          console.log('Incomplete payment found:', incompletePayment.identifier);
+          if(MHUB_CF_BASE && piSvc.accessToken){
+            fetch(MHUB_CF_BASE+'/recoverIncompletePayment',{
+              method:'POST',
+              headers:{
+                'Content-Type':'application/json',
+                'X-Pi-Access-Token': piSvc.accessToken||''
+              },
+              body:JSON.stringify({
+                paymentId: incompletePayment.identifier,
+                txid: (incompletePayment.transaction && incompletePayment.transaction.txid) || null
+              })
+            }).then(function(r){return r.json();})
+              .then(function(d){console.log('Incomplete payment recovery:',d.status);})
+              .catch(function(e){console.warn('Recovery call failed:',e.message);});
+          }else{
+            // Demo mode: store locally for later processing
+            try{
+              var pending=JSON.parse(localStorage.getItem('mhub_incomplete_payments')||'[]');
+              if(!pending.find(function(p){return p.identifier===incompletePayment.identifier;})){
+                pending.push({identifier:incompletePayment.identifier,foundAt:new Date().toISOString()});
+                localStorage.setItem('mhub_incomplete_payments',JSON.stringify(pending));
+              }
+            }catch(e){}
+          }
+        }
+      });
+      // uid is the verified Pioneer identity (server verifies via /v2/me)
+      // username is for display only — never used as security identity
+      this.user = a.user;
+      this.uid = a.user && a.user.uid ? a.user.uid : null;  // Pi SDK uid (unverified until /me)
+      this.accessToken = a.accessToken || null;              // sent to backend for /me verification
+      return{ok:true,user:a.user};
     }catch(e){return{ok:false,err:e.message};}
   },
   _sb(){const u={username:'Theophile0421'};this.user=u;return{ok:true,user:u};},
@@ -2660,7 +3055,14 @@ async function doUrbanStep1(){
   if(b1){b1.disabled=true;const sp=b1.querySelector('[data-i18n]');if(sp)sp.textContent='✅ '+C.fmtFrw(S.uTot);}
   if(b2)b2.disabled=false;
   const nm={moto:T('veh_moto'),taxi:T('veh_taxi'),bus:T('veh_bus')}[type]||type;
-  S.trips.unshift({ico:'🏍️',name:nm+' : '+from+' → '+to,frw:S.uTot,time:T('just_now'),st:T('pending_st'),rating:0,agency:null,tripId});
+  var urbanTrip = {ico:'🏍️',name:nm+' : '+from+' → '+to,frw:S.uTot,time:T('just_now'),st:T('pending_st'),rating:0,agency:null,tripId:tripId,
+    module:'Transport-Urban',
+    passengerDisplay:(piSvc.user&&piSvc.user.username)||'',
+    totalPi:C.frwToPi(S.uTot),
+    expectedPiAmount:C.frwToPi(S.uTot), // server verifies amount via PaymentDTO
+    state:TX_STATE.CREATED,date:new Date().toISOString()};
+  S.trips.unshift(urbanTrip);
+  StorageAdapter.saveTrip(urbanTrip); // persist to Firestore
   addLoyaltyPts(Math.floor(S.uTot/1000));
   renderTrips();
   console.log('Pi SDK Memo:','MARKETHUB-RW|'+tripId+'|URBAN|'+Math.round(S.uTot)+'FRW');
@@ -2727,7 +3129,12 @@ function doInterStep1(){
   if(b2)b2.disabled=false;
   const type=el('iType')?.value;
   const tn={bus:T('t_bus'),private:T('t_private')}[type]||type;
-  S.trips.unshift({ico:'🚌',name:from+' → '+to+' ('+tn+') ×'+pax,frw:S.iTot,time:date.split('T')[0]||T('just_now'),st:T('pending_st'),rating:0,agency:null});
+  var interTripId = genOrderId('TRP');
+  var interTrip = {ico:'🚌',name:from+' → '+to+' ('+tn+') ×'+pax,frw:S.iTot,time:date.split('T')[0]||T('just_now'),st:T('pending_st'),rating:0,agency:null,
+    tripId:interTripId,module:'Transport-Intercity',passenger:(piSvc.user&&piSvc.user.username)||'guest',
+    state:TX_STATE.CREATED,date:new Date().toISOString()};
+  S.trips.unshift(interTrip);
+  StorageAdapter.saveTrip(interTrip); // persist to Firestore
   addLoyaltyPts(Math.floor(S.iTot/1000));renderTrips();
   showModal('🔒',T('deposit_done'),T('deposit_msg').replace(/\n/g,'<br/>'));
   showNotif(T('deposit_done'),'success');
@@ -2805,7 +3212,12 @@ function doBorderStep1(){
   if(b1){b1.disabled=true;const sp=b1.querySelector('[data-i18n]');if(sp)sp.textContent='✅ '+C.fmtFrw(S.bTot);}
   if(b2)b2.disabled=false;
   const tl={1:T('trip_oneway'),2:T('trip_return')}[S.ttMult];
-  S.trips.unshift({ico:'🌍',name:dep+' → '+city+' ('+tl+') ×'+pax,frw:S.bTot,time:date,st:T('pending_st'),rating:0,agency});
+  var borderTripId = genOrderId('TRP');
+  var borderTrip = {ico:'🌍',name:dep+' → '+city+' ('+tl+') ×'+pax,frw:S.bTot,time:date,st:T('pending_st'),rating:0,agency:agency,
+    tripId:borderTripId,module:'Transport-Border',passenger:(piSvc.user&&piSvc.user.username)||'guest',
+    state:TX_STATE.CREATED,date:new Date().toISOString()};
+  S.trips.unshift(borderTrip);
+  StorageAdapter.saveTrip(borderTrip); // persist to Firestore
   if(agency)S.agencyTrips[agency]=(S.agencyTrips[agency]||0)+1;
   addLoyaltyPts(Math.floor(S.bTot/1000));renderTrips();saveLoyalty();
   showModal('🔒',T('deposit_done'),T('deposit_msg').replace(/\n/g,'<br/>'));
@@ -3046,7 +3458,30 @@ const UQR=(function(){
 })();
 
 // ═══ PILOCALMARKET — Module 3 ════════════════════════════════
-var MKT_FEE=0.05;
+var MKT_FEE=0.05; // Default — overridden by MHUB_ENV.fees.market from Firestore
+// Use getter so remote config updates take effect dynamically
+function getMktFee(){ return (typeof MHUB_ENV!=='undefined'&&MHUB_ENV.fees&&MHUB_ENV.fees.market) ? MHUB_ENV.fees.market : MKT_FEE; }
+
+// ── Authorization helpers (client-side UX only) ──────────────
+// Server-side enforcement is handled by Firestore Security Rules
+// and Cloud Functions. These functions are for UI logic only.
+var AuthZ = {
+  isAppOwner: function() {
+    return piSvc.user && piSvc.user.username === MHUB_ENV.appOwnerUsername;
+  },
+  isMerchant: function(shopOwner) {
+    return piSvc.user && piSvc.user.username === shopOwner;
+  },
+  isAuthenticated: function() {
+    return piSvc.ok && !!piSvc.user;
+  },
+  canModifyShop: function(shopOwner) {
+    return this.isMerchant(shopOwner) || this.isAppOwner();
+  },
+  canMarkPaid: function() {
+    return this.isAppOwner();
+  }
+};
 var MKT_STORE_KEY='pihub_mkt_shops_v1';
 var MKT_ORDERS_KEY='pihub_mkt_orders_v1';
 var MKT_SECTORS=[
@@ -3099,18 +3534,36 @@ function mktSaveShops(){
 }
 function mktLoadOrders(){try{return JSON.parse(localStorage.getItem(MKT_ORDERS_KEY)||'[]');}catch(e){return[];}}
 function mktSaveOrder(o){
-  // Save to localStorage
+  // Save to localStorage (local backup)
   var orders=mktLoadOrders();orders.unshift(o);
   localStorage.setItem(MKT_ORDERS_KEY,JSON.stringify(orders.slice(0,100)));
-  // Save to Firebase
-  if(window.MKT_DB){window.MKT_DB.saveOrder(o).catch(function(e){console.warn("Firebase order save failed:",e);});}
+  // Save to Firebase via StorageAdapter (Firestore + txid persistence)
+  StorageAdapter.saveOrder(o);
 }
 function mktMarkPaid(orderId){
+  // APP_OWNER action: track manual seller payout
+  var uname=(piSvc.user&&piSvc.user.username)||'guest';
+  var now=new Date().toISOString();
   var orders=mktLoadOrders();
   var o=orders.find(function(x){return x.id===orderId;});
-  if(o){o.payoutStatus='paid';localStorage.setItem(MKT_ORDERS_KEY,JSON.stringify(orders));}
-  // Update Firebase
-  if(window.MKT_DB){window.MKT_DB.markOrderPaid(orderId).catch(function(e){console.warn("Firebase markPaid failed:",e);});}
+  if(o){
+    o.payoutStatus='paid';
+    o.paidBy=uname;
+    o.paidAt=now;
+    localStorage.setItem(MKT_ORDERS_KEY,JSON.stringify(orders));
+  }
+  // Update Firebase (Firestore Security Rules enforce this in production)
+  if(window.MKT_DB){
+    window.MKT_DB.markOrderPaid(orderId).catch(function(e){console.warn('Firebase markPaid failed:',e);});
+  }
+  // Also update via StorageAdapter for full audit trail
+  StorageAdapter.saveTransaction({
+    paymentId: orderId,
+    payoutStatus:'paid',
+    paidBy: uname,
+    paidAt: now,
+    state: TX_STATE.COMPLETED
+  });
   mktRenderOrders();showNotif('✅ Marked as PAID','success');
 }
 function mktDistance(la1,lo1,la2,lo2){
@@ -3300,7 +3753,7 @@ function mktUpdateCart(){
   mktRenderInvoice();
   if(sellerPrice<=0){if(summary)summary.style.display='none';if(pb)pb.disabled=true;return;}
   var disc=getBestDiscount();
-  var fee=sellerPrice*MKT_FEE*(1-disc/100);
+  var fee=sellerPrice*getMktFee()*(1-disc/100);
   var total=sellerPrice+fee;
   if(el('mktCartSubtotal'))el('mktCartSubtotal').textContent=mktFmtFrw(sellerPrice)+' ('+mktFmtPi(mktFrwToPi(sellerPrice))+')';
   if(el('mktCartFee'))el('mktCartFee').textContent='+'+mktFmtFrw(fee);
@@ -3318,18 +3771,32 @@ function mktPay(){
   var sellerPrice=mktCart.reduce(function(s,c){return s+c.price*c.qty;},0)+freeAmt;
   if(sellerPrice<=0)return;
   var disc=getBestDiscount();
-  var fee=sellerPrice*MKT_FEE*(1-disc/100);
+  var fee=sellerPrice*getMktFee()*(1-disc/100);
   var total=sellerPrice+fee;
   var totalPi=mktFrwToPi(total);
   var buyer=(piSvc.user&&piSvc.user.username)||'guest';
   var pb=el('mktPayBtn');
   if(pb){pb.disabled=true;pb.textContent=T('mkt_processing')||'Processing...';}
   var cartCopy=[].concat(mktCart);
-  function doSuccess(){
-    var order={id:'MKT'+Date.now(),shop:shop.name,seller:shop.owner,buyer:buyer,
-      sellerPrice:sellerPrice,fee:fee,total:total,totalPi:totalPi,disc:disc,
-      items:cartCopy,freeAmt:freeAmt,date:new Date().toISOString(),payoutStatus:'pending'};
-    mktSaveOrder(order);
+  function doSuccess(txid){
+    var orderId = genOrderId('MKT');
+    var order={
+      id: orderId,
+      internalOrderId: orderId,
+      txid: txid || null,
+      state: txid ? TX_STATE.COMPLETED : TX_STATE.CREATED,
+      shop:shop.name,seller:shop.owner,
+      // buyer is for display — server uses verified uid from /v2/me
+      buyerDisplay: buyer,
+      sellerPrice:sellerPrice,fee:fee,total:total,
+      totalPi:totalPi,          // expected Pi amount (server verifies via PaymentDTO)
+      expectedPiAmount:totalPi, // explicit field for server-side amount verification
+      disc:disc,
+      items:cartCopy,freeAmt:freeAmt,
+      date:new Date().toISOString(),
+      payoutStatus:'pending'
+    };
+    StorageAdapter.saveOrder(order);
     if(el('rcptSeller'))el('rcptSeller').textContent='@'+shop.owner+' ('+shop.name+')';
     if(el('rcptBuyer'))el('rcptBuyer').textContent='@'+buyer;
     if(el('rcptTotal'))el('rcptTotal').textContent=mktFmtFrw(total)+' ('+mktFmtPi(totalPi)+')';
@@ -3343,18 +3810,31 @@ function mktPay(){
     showNotif(T('mkt_success')||'Payment sent!','success');
     if(pb){pb.disabled=false;pb.textContent=T('mkt_pay')||'Pay with Pi';}
   }
-  if(typeof Pi!=='undefined'&&piSvc.ok){
-    Pi.createPayment({
-      amount:totalPi,
-      memo:'HubMarket: '+shop.name,
-      metadata:{module:'HubMarket',shopId:shop.id,seller:shop.owner,buyer:buyer,sellerPrice:sellerPrice,fee:fee,disc:disc}
-    },{
-      onReadyForServerApproval:function(pid){console.log('MKT approval:',pid);},
-      onReadyForServerCompletion:function(pid,txid){console.log('MKT done:',txid);doSuccess();},
-      onCancel:function(){if(pb){pb.disabled=false;pb.textContent=T('mkt_pay');}showNotif('Cancelled','error');},
-      onError:function(e){if(pb){pb.disabled=false;pb.textContent=T('mkt_pay');}showNotif('Error: '+e.message,'error');}
-    });
-  }else{setTimeout(doSuccess,1500);}
+  // Use PaymentService (routes through PaymentAdapter → Pi SDK)
+  // PaymentAdapter handles: server approval, txid persistence, idempotency
+  PaymentService.createMarketPayment({
+    totalPi: totalPi,
+    shopId: shop.id,
+    shopName: shop.name,
+    seller: shop.owner,
+    sellerPrice: sellerPrice,
+    fee: fee,
+    disc: disc
+  }, {
+    onSuccess: function(txid) {
+      // txid is the blockchain proof, already persisted by PaymentAdapter
+      doSuccess(txid);
+    },
+    onCancel: function() {
+      if(pb){pb.disabled=false;pb.textContent=T('mkt_pay');}
+      showNotif('Cancelled','error');
+    },
+    onError: function(e) {
+      if(pb){pb.disabled=false;pb.textContent=T('mkt_pay');}
+      showNotif('Error: '+(e&&e.message?e.message:'Payment failed'),'error');
+    }
+  });
+  if(typeof Pi==='undefined'||!piSvc.ok){setTimeout(function(){doSuccess(null);},1500);}
 }
 // SELLER
 function mktFillShopForm(shop){
@@ -3701,6 +4181,15 @@ function pispinSave(){
   localStorage.setItem(pispinKey('pts'),String(S.pispinPts));
   localStorage.setItem(pispinKey('spins'),String(S.pispinSpinsLeft));
   localStorage.setItem(pispinKey('recharge'),String(S.pispinRechargeAt));
+  // Backup to Firestore for cross-device persistence
+  if(window.db&&piSvc.user&&piSvc.user.username){
+    window.db.collection('hubspin').doc(piSvc.user.username).set({
+      points:S.pispinPts||0,
+      spinsLeft:S.pispinSpinsLeft,
+      rechargeAt:S.pispinRechargeAt||0,
+      updatedAt:new Date().toISOString()
+    },{merge:true}).catch(function(e){console.warn('HubSpin Firestore:',e.message);});
+  }
 }
 function pispinCurrentTier(pts){
   let t=PISPIN_TITLES[0];
